@@ -10,6 +10,24 @@ import flwr as fl
 from typing import Dict, List, Tuple, Optional
 from collections import OrderedDict
 import logging
+from fastapi import FastAPI, HTTPException
+import uvicorn
+import threading
+import time
+import sys
+
+# Initialize FastAPI
+app = FastAPI()
+
+# Enable CORS
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://10.26.65.217:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -122,26 +140,86 @@ class FlowerClient(fl.client.NumPyClient):
         return float(loss), len(self.X_test), {"accuracy": accuracy}
 
 def main():
-    # Load data
     try:
+        # Load data
         X_train, X_test, y_train, y_test = load_heart_disease_data()
         logger.info(f"Loaded Heart Disease dataset: {len(X_train)} training samples, {len(X_test)} test samples")
+        
+        # Initialize model
+        model = HeartDiseaseModel(input_size=X_train.shape[1])
+        client = FlowerClient(model, X_train, y_train, X_test, y_test)
+        
+        # Connect to server
+        server_address = "10.26.65.217:8080"
+        logger.info(f"Connecting to server at {server_address}...")
+        
+        # Start Flower client (run in main thread)
+        fl.client.start_numpy_client(
+            server_address=server_address,
+            client=client
+        )
+        
+        return client
+        
     except Exception as e:
-        logger.error(f"Error loading dataset: {e}")
-        return
+        logger.error(f"Error in client: {e}")
+        raise
+
+# Store the client instance for prediction
+global_client = None
+
+@app.post("/predict")
+async def predict(patient_data: dict):
+    global global_client
+    if not global_client:
+        raise HTTPException(status_code=500, detail="Client not initialized")
     
-    # Initialize model
-    model = HeartDiseaseModel(input_size=X_train.shape[1])
-    
-    # Start client
-    client = FlowerClient(model, X_train, y_train, X_test, y_test)
-    
-    # Connect to server
-    logger.info("Connecting to server at localhost:8080...")
-    fl.client.start_numpy_client(
-        server_address="localhost:8080",
-        client=client
-    )
+    try:
+        # Convert patient data to model input format
+        features = [
+            float(patient_data['age']),
+            float(patient_data['sex']),
+            float(patient_data['cp']),
+            float(patient_data['trestbps']),
+            float(patient_data['chol']),
+            float(patient_data['fbs']),
+            float(patient_data['restecg']),
+            float(patient_data['thalach']),
+            float(patient_data['exang']),
+            float(patient_data['oldpeak']),
+            float(patient_data['slope']),
+            float(patient_data['ca']),
+            float(patient_data['thal'])
+        ]
+        
+        # Convert to tensor and predict
+        features_tensor = torch.FloatTensor([features]).to(global_client.device)
+        global_client.model.eval()
+        with torch.no_grad():
+            output = global_client.model(features_tensor)
+            probability = torch.softmax(output, dim=1)[0][1].item() * 100
+        
+        return {
+            "probability": round(probability, 2),
+            "message": "High risk" if probability > 50 else "Low risk"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+def start_fastapi():
+    uvicorn.run(app, host="10.26.65.217", port=5000)
 
 if __name__ == "__main__":
-    main()
+    # Start FastAPI server in a separate thread
+    fastapi_thread = threading.Thread(target=start_fastapi, daemon=False)  # Changed to non-daemon
+    fastapi_thread.start()
+    
+    try:
+        # Store the client instance
+        global_client = main()
+        # Keep the main thread alive
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        sys.exit(0)
