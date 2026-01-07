@@ -1,3 +1,4 @@
+# improved_server.py
 import time
 import flwr as fl
 import torch.nn as nn
@@ -5,6 +6,10 @@ import torch
 import socket
 import logging
 import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from typing import Dict, List, Optional, Tuple, Union
 from flwr.server.strategy import FedProx
 from flwr.server.client_manager import SimpleClientManager
@@ -16,27 +21,22 @@ from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 1. Define the Global Model Architecture
-class DiabetesModel(nn.Module):
+# 1. Simplified Model Architecture for Better Generalization
+class ImprovedDiabetesModel(nn.Module):
     def __init__(self, input_size=8, num_classes=2):
-        super(DiabetesModel, self).__init__()
+        super(ImprovedDiabetesModel, self).__init__()
+        # Simplified architecture to reduce overfitting
         self.layer1 = nn.Sequential(
-            nn.Linear(input_size, 32),
-            nn.LeakyReLU(0.1),
-            nn.BatchNorm1d(32),
-            nn.Dropout(0.5)
-        )
-        self.layer2 = nn.Sequential(
-            nn.Linear(32, 16),
+            nn.Linear(input_size, 16),  # Reduced from 32
             nn.LeakyReLU(0.1),
             nn.BatchNorm1d(16),
-            nn.Dropout(0.4)
+            nn.Dropout(0.6)  # Increased dropout
         )
-        self.layer3 = nn.Sequential(
+        self.layer2 = nn.Sequential(
             nn.Linear(16, 8),
             nn.LeakyReLU(0.1),
             nn.BatchNorm1d(8),
-            nn.Dropout(0.3)
+            nn.Dropout(0.5)  # Increased dropout
         )
         self.output = nn.Linear(8, num_classes)
         
@@ -59,11 +59,53 @@ class DiabetesModel(nn.Module):
             x = x.unsqueeze(0)
         x = self.layer1(x)
         x = self.layer2(x)
-        x = self.layer3(x)
         return self.output(x)
 
-# Initialize model with 8 features to match the client's dataset
-model = DiabetesModel(input_size=8, num_classes=2)  # 8 features, 2 classes (diabetes/no diabetes)
+# Load and create server-side validation set
+def load_server_validation_data():
+    """Load a separate validation dataset for server-side evaluation"""
+    try:
+        # Use part2 as validation set to ensure data diversity
+        df = pd.read_csv('diabetes_non_negative_part2_2000.csv')
+        
+        feature_columns = [
+            'Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 
+            'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age'
+        ]
+        
+        if all(col in df.columns for col in feature_columns):
+            X = df[feature_columns].values
+            y = df['Outcome'].values if 'Outcome' in df.columns else df.iloc[:, -1].values
+        else:
+            X = df.iloc[:, :8].values
+            y = df.iloc[:, -1].values
+            
+        # Convert target to binary if needed
+        if len(np.unique(y)) > 2:
+            y = (y > 0).astype(int)
+            
+        # Split into train/validation for server
+        X_server_train, X_val, y_server_train, y_val = train_test_split(
+            X, y, test_size=0.3, random_state=42, stratify=y
+        )
+        
+        # Standardize
+        scaler = StandardScaler()
+        X_val = scaler.fit_transform(X_val)
+        
+        # Convert to tensors
+        X_val = torch.FloatTensor(X_val)
+        y_val = torch.LongTensor(y_val)
+        
+        logger.info(f"Server validation set: {len(X_val)} samples")
+        return X_val, y_val, scaler
+        
+    except Exception as e:
+        logger.warning(f"Could not load server validation data: {e}")
+        return None, None, None
+
+# Initialize improved model
+model = ImprovedDiabetesModel(input_size=8, num_classes=2)
 
 # Initialize model weights
 def init_weights(m):
@@ -77,13 +119,15 @@ def init_weights(m):
 
 model.apply(init_weights)
 
+# Load server validation data
+X_val, y_val, val_scaler = load_server_validation_data()
+
 # Log model architecture for debugging
-logger.info("Server model architecture:")
+logger.info("Improved Server model architecture:")
 logger.info(model)
 
 # Helper functions
 def get_initial_parameters(model):
-    # Make sure to detach and clone to avoid any potential in-place modifications
     return [p.detach().cpu().numpy().copy() for p in model.parameters()]
 
 def weighted_average(metrics):
@@ -94,19 +138,51 @@ def weighted_average(metrics):
 def fit_config(server_round: int):
     return {
         "round": server_round,
-        "epochs": 1,
+        "epochs": 1,  # Keep at 1 to prevent client drift
+        "learning_rate": 0.001,  # Reduced learning rate
+        "weight_decay": 5e-4,  # Increased weight decay for stronger regularization
     }
 
 def evaluate_config(server_round: int):
     return {"round": server_round}
 
-# Define FedProx strategy for non-IID data
-class CustomFedProx(FedProx):
+# Server-side evaluation function
+def server_evaluate(model, X_val, y_val):
+    """Evaluate model on server-side validation set"""
+    if X_val is None or y_val is None:
+        return None
+        
+    model.eval()
+    with torch.no_grad():
+        outputs = model(X_val)
+        _, predicted = torch.max(outputs.data, 1)
+        
+        # Calculate metrics
+        y_true = y_val.numpy()
+        y_pred = predicted.numpy()
+        
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        
+        logger.info(f"Server Validation - Accuracy: {accuracy:.4f}, "
+                   f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+        
+        return {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
+        }
+
+# Improved FedProx strategy with server-side validation
+class ImprovedFedProx(FedProx):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.global_test_loader = None  # Will be set before evaluation
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.global_model = model.to(self.device)
+        self.server_val_results = []
     
     def aggregate_fit(
         self,
@@ -123,31 +199,36 @@ class CustomFedProx(FedProx):
         
         # Update global model with new parameters
         if aggregated_parameters is not None:
-            # Convert Parameters to list of numpy arrays
             parameters = fl.common.parameters_to_ndarrays(aggregated_parameters)
-            # Create state dict with model's keys and new parameters
             params_dict = zip(self.global_model.state_dict().keys(), parameters)
             state_dict = {k: torch.tensor(v) if isinstance(v, np.ndarray) else v 
                          for k, v in params_dict}
             self.global_model.load_state_dict(state_dict, strict=True)
+            
+            # Server-side validation
+            val_metrics = server_evaluate(self.global_model, X_val, y_val)
+            if val_metrics:
+                self.server_val_results.append((server_round, val_metrics))
+                metrics_aggregated.update({f"server_{k}": v for k, v in val_metrics.items()})
             
         return aggregated_parameters, metrics_aggregated
     
     def configure_fit(
         self, server_round: int, parameters: Parameters, client_manager: fl.server.client_manager.ClientManager
     ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitIns]]:
-        # Configure clients with proximal term mu
+        # Configure clients with improved hyperparameters
         config = {
             "round": server_round,
-            "epochs": 1,  # Reduced to 1 to minimize client drift
+            "epochs": 1,  # Keep at 1 to minimize client drift
+            "learning_rate": max(0.001 * (0.95 ** server_round), 0.0001),  # Learning rate decay
             "proximal_mu": 0.1,  # FedProx parameter
+            "weight_decay": 5e-4,  # Increased regularization
         }
         return super().configure_fit(server_round, parameters, client_manager)
     
     def configure_evaluate(
         self, server_round: int, parameters: Parameters, client_manager: fl.server.client_manager.ClientManager
     ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateIns]]:
-        # Only evaluate on a subset of clients
         config = {"round": server_round}
         clients = client_manager.sample(
             num_clients=min(self.min_evaluate_clients, client_manager.num_available()),
@@ -155,33 +236,19 @@ class CustomFedProx(FedProx):
         )
         return [(client, fl.common.EvaluateIns(parameters, config)) for client in clients]
 
-# Define strategy with FedProx - Updated to require 2 clients
-strategy = CustomFedProx(
-    min_fit_clients=2,        # Require 2 clients for training
-    min_available_clients=2,  # Need 2 clients to be available
-    min_evaluate_clients=2,   # Evaluate on both clients
-    fraction_fit=1.0,         # Use 100% of available clients for training
-    fraction_evaluate=1.0,    # Evaluate on 100% of available clients
+# Define improved strategy
+strategy = ImprovedFedProx(
+    min_fit_clients=2,
+    min_available_clients=2,
+    min_evaluate_clients=2,
+    fraction_fit=1.0,
+    fraction_evaluate=1.0,
     evaluate_metrics_aggregation_fn=weighted_average,
     on_fit_config_fn=fit_config,
     on_evaluate_config_fn=evaluate_config,
     initial_parameters=fl.common.ndarrays_to_parameters(get_initial_parameters(model)),
-    proximal_mu=0.1,  # FedProx parameter
+    proximal_mu=0.1,
 )
-
-class PersistentServer(fl.server.Server):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.keep_running = True
-
-    def run(self, num_rounds: int, timeout: Optional[float]) -> History:
-        history = super().run(num_rounds, timeout)
-        print("\nTraining completed. Keeping server alive for new connections...")
-        while self.keep_running:
-            time.sleep(1)
-        return history
-
-# ... (previous imports and model definition remain the same) ...
 
 def main():
     # Start FastAPI server in a separate thread
@@ -212,7 +279,6 @@ def main():
     async def predict(data: dict):
         try:
             # Convert input data to tensor and make prediction
-            # Using only 9 features as expected by the model
             input_features = [
                 float(data.get('Pregnancies', 0)),
                 float(data.get('Glucose', 0)),
@@ -222,29 +288,29 @@ def main():
                 float(data.get('BMI', 0)),
                 float(data.get('DiabetesPedigreeFunction', 0)),
                 float(data.get('Age', 0))
-                # Removed 'Outcome' as it's the target variable
             ]
+            
+            # Apply server-side scaling if available
+            if val_scaler is not None:
+                input_features = val_scaler.transform([input_features])[0]
             
             # Convert to tensor and predict
             model.eval()
             with torch.no_grad():
                 input_tensor = torch.FloatTensor([input_features])
                 output = model(input_tensor)
-                # Apply softmax to get probabilities
                 probabilities = torch.softmax(output, dim=1)
-                # Get the probability of the positive class (class 1)
                 risk_percentage = round(probabilities[0][1].item() * 100, 2)
                 
-                # Debug information
                 print(f"Model output: {output}")
                 print(f"Probabilities: {probabilities}")
                 print(f"Risk percentage: {risk_percentage}%")
                 
-            # Determine risk level based on probability with better thresholds
-            if risk_percentage < 25:
+            # Determine risk level based on medical diabetes risk standards
+            if risk_percentage < 20:
                 risk_level = "Low"
                 recommendation = "Maintain a healthy lifestyle with regular exercise and balanced diet."
-            elif risk_percentage < 75:
+            elif risk_percentage < 50:
                 risk_level = "Moderate"
                 recommendation = "Consider lifestyle changes and regular monitoring. Consult a healthcare provider."
             else:
@@ -264,7 +330,7 @@ def main():
     
     # Start FastAPI server in a separate thread
     def run_fastapi():
-        uvicorn.run(app, host="0.0.0.0", port=5000)  # Server API on port 5000
+        uvicorn.run(app, host="0.0.0.0", port=5000)
     
     fastapi_thread = threading.Thread(target=run_fastapi, daemon=True)
     fastapi_thread.start()
@@ -273,45 +339,48 @@ def main():
     server_ip = '127.0.0.1'
     
     print("\n" + "="*50)
-    print(f"Starting Diabetes Prediction Server")
+    print(f"Starting IMPROVED Diabetes Prediction Server")
     print("="*50)
     print(f"Flower server running on: {server_ip}:8080")
     print(f"FastAPI server running on: http://{server_ip}:5000")
-    print("\nServer is running. Will work with 1 or 2 clients...")
+    print(f"Features: Simplified architecture, stronger regularization, server-side validation")
     print("="*50)
     
     try:
-        # Start Flower server with more communication rounds
+        # Start Flower server with improved configuration
         history = fl.server.start_server(
             server_address=f"{server_ip}:8080",
             config=fl.server.ServerConfig(
-                num_rounds=30,  # Increased from 10 to 30 for better convergence
-                round_timeout=120,  # 2 minute timeout per round
+                num_rounds=25,  # Reduced rounds to prevent overfitting
+                round_timeout=120,
             ),
             strategy=strategy
         )
         
         # Save final model
-        torch.save(model.state_dict(), 'global_model_final.pth')
-        print("\nFinal global model saved to global_model_final.pth")
+        torch.save(model.state_dict(), 'improved_global_model.pth')
+        print("\nImproved global model saved to improved_global_model.pth")
         
-        # After training completes
-        print("\n" + "="*50)
-        print("Training completed! Starting server test...")
+        # Print server validation results
+        if strategy.server_val_results:
+            print("\n" + "="*50)
+            print("SERVER-SIDE VALIDATION RESULTS:")
+            print("="*50)
+            for round_num, metrics in strategy.server_val_results:
+                print(f"Round {round_num}: Accuracy={metrics['accuracy']:.4f}, "
+                      f"F1={metrics['f1_score']:.4f}")
+        
+        print("\nTraining completed! Starting server test...")
         print("="*50)
         
         # Import and run test
         import subprocess
         import sys
-        
-        # Use the same Python interpreter that's running the server
         python = sys.executable
         subprocess.Popen([python, "test_server.py"])
         
-        # Keep server running for predictions
         print("\nServer is running and ready for predictions.")
         print("Press Ctrl+C to stop the server.")
-        print("Test the prediction endpoint with: python test_server.py")
         print("="*50 + "\n")
         
         while True:
