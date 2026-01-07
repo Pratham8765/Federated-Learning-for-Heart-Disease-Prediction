@@ -269,14 +269,20 @@ def main():
     fastapi_thread = threading.Thread(target=run_fastapi, daemon=True)
     fastapi_thread.start()
     
-    # Use localhost for local testing
-    server_ip = '127.0.0.1'
+    # Bind to 0.0.0.0 for network deployment
+    server_ip = '0.0.0.0'
+    
+    # Get and display the server's machine IP address
+    import socket
+    machine_ip = socket.gethostbyname(socket.gethostname())
     
     print("\n" + "="*50)
     print(f"Starting Diabetes Prediction Server")
     print("="*50)
-    print(f"Flower server running on: {server_ip}:8080")
+    print(f"Flower server binding to: {server_ip}:8080")
+    print(f"Machine IP Address: {machine_ip}")
     print(f"FastAPI server running on: http://{server_ip}:5000")
+    print(f"\nClients should connect to: {machine_ip}:8080")
     print("\nServer is running. Will work with 1 or 2 clients...")
     print("="*50)
     

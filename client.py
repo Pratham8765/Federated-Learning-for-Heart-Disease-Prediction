@@ -21,6 +21,9 @@ import argparse
 import socket
 import torch.utils.data as data
 
+# Server IP Configuration - UPDATE THIS FOR NETWORK DEPLOYMENT
+SERVER_IP = "10.133.98.49"  # Server's actual IP address
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -432,16 +435,26 @@ def get_local_ip():
 def run_client():
     # Parse command line arguments for the main process
     parser = argparse.ArgumentParser(description='Federated Learning Client for Diabetes Prediction')
-    parser.add_argument('--server-address', type=str, default="127.0.0.1:8080",
-                      help='Address of the server in the format host:port (default: 127.0.0.1:8080)')
+    parser.add_argument('--server-address', type=str, default=f"{SERVER_IP}:8080",
+                      help='Address of the server in the format host:port (default: SERVER_IP:8080)')
     parser.add_argument('--client-id', type=int, required=True,
                       help='Unique identifier for this client (required)')
     parser.add_argument('--batch-size', type=int, default=32,
                       help='Batch size for training (default: 32)')
-    parser.add_argument('--dataset', type=str, default='diabetes_non_negative_part1_2000.csv',
-                      help='Path to the dataset file (default: diabetes_non_negative_part1_2000.csv)')
     
     args = parser.parse_args()
+    
+    # Dynamic data loading based on client ID
+    if args.client_id == 1:
+        dataset_file = 'diabetes_non_negative_part1_2000.csv'
+        logger.info(f"Client {args.client_id}: Loading dataset part 1")
+    elif args.client_id == 2:
+        dataset_file = 'diabetes_non_negative_part2_2000.csv'
+        logger.info(f"Client {args.client_id}: Loading dataset part 2")
+    else:
+        # Default to part1 for any other client ID
+        dataset_file = 'diabetes_non_negative_part1_2000.csv'
+        logger.info(f"Client {args.client_id}: Loading default dataset part 1")
     
     try:
         logger.info("=" * 50)
@@ -449,7 +462,7 @@ def run_client():
         logger.info("=" * 50)
         
         # Load and preprocess the dataset
-        X_train, X_test, y_train, y_test = load_diabetes_data(file_path=args.dataset)
+        X_train, X_test, y_train, y_test = load_diabetes_data(file_path=dataset_file)
         
         # Log dataset information
         logger.info(f"Dataset loaded successfully:")
